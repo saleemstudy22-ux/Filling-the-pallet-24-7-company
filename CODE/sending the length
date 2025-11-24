@@ -1,0 +1,93 @@
+import socket
+import tkinter as tk
+from tkinter import messagebox
+
+# ------------------------------------------------------------------------------
+# SETTINGS: Doosan Robot Controller IP + PORT
+# ------------------------------------------------------------------------------
+ROBOT_IP = "192.168.137.10"      # <<< Your robot IP
+ROBOT_PORT = 5000                # <<< Must match DRL socket_open port
+
+MIN_LEN = 300    # mm
+MAX_LEN = 1000   # mm
+
+
+def send_length():
+    """
+    Validate tube length, then send it to the Doosan robot controller.
+    Ensures length is between 300 mm and 1000 mm before sending.
+    """
+    length_text = entry_length.get().strip()
+
+    # Validate numeric input
+    if not length_text.isdigit():
+        messagebox.showerror("Input Error", "Please enter a numeric length in millimeters.")
+        return
+
+    length = int(length_text)
+
+    # Validate allowed range
+    if length < MIN_LEN or length > MAX_LEN:
+        messagebox.showerror(
+            "Invalid Length",
+            f"Length {length} mm is not valid.\nRobot only accepts values between 300 mm and 1000 mm."
+        )
+        return
+
+    # Try sending to robot
+    try:
+        message = f"LENGTH:{length}"
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((ROBOT_IP, ROBOT_PORT))
+        sock.sendall(message.encode())
+        sock.close()
+
+        messagebox.showinfo("Success", f"Length {length} mm sent to robot.")
+
+    except Exception as error:
+        messagebox.showerror("Connection Error", f"Failed to send data:\n{error}")
+
+
+# ------------------------------------------------------------------------------
+# GUI WINDOW
+# ------------------------------------------------------------------------------
+window = tk.Tk()
+window.title("Tube Length Sender")
+window.geometry("420x300")
+
+# Company Name
+company_label = tk.Label(window,
+                         text="24/7 Lasersnijden",
+                         font=("Arial", 18, "bold"))
+company_label.pack(pady=5)
+
+# Header Label
+header_label = tk.Label(window,
+                        text="Enter Tube Length (mm)",
+                        font=("Arial", 16, "bold"))
+header_label.pack(pady=10)
+
+# Info label
+info_label = tk.Label(window,
+                      text="Allowed range: 300 mm to 1000 mm",
+                      font=("Arial", 12))
+info_label.pack(pady=5)
+
+# Input Field
+entry_length = tk.Entry(window,
+                        font=("Arial", 16),
+                        justify="center",
+                        width=15)
+entry_length.pack(pady=5)
+
+# Send Button
+btn_send = tk.Button(window,
+                     text="Send to Doosan Robot",
+                     font=("Arial", 14),
+                     command=send_length,
+                     width=20)
+btn_send.pack(pady=20)
+
+# Run GUI
+window.mainloop()
