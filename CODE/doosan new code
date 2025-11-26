@@ -1,0 +1,230 @@
+# Doosan DRL - Tube stacking program (DART Studio)
+# - Receives LENGTH:<value> from external Python app over TCP
+# - Validates length between 300 and 1000 mm
+# - Waits photo sensor before picking
+# - Uses pneumatic gripper IO
+# - Stacks onto Euro-pallet (1200x800 mm) with 1/2/3 rows per layer rule
+# - Uses movej/movel/trans with velocity/accel settings
+#
+# Adjust indexes/poses/params below to match your cell before testing.
+
+# -----------------------------
+# --- Configuration / params ---
+# -----------------------------
+PHOTO_IN = 1            # digital input index for photo sensor (controller IO)
+GRIP_OUT = 1            # digital output index for pneumatic gripper (controller IO)
+ON = 1
+OFF = 0
+
+# TCP server (your PC running Python app) - change IP/PORT as needed
+SERVER_IP = "192.168.137.100"
+SERVER_PORT = 20002
+
+# Pallet geometry (Euro pallet mm)
+PALLET_LENGTH = 1200.0   # X dimension (mm)
+PALLET_WIDTH  = 800.0    # Y dimension (mm)
+PALLET_EDGE_MARGIN = 50.0  # mm safe margin from pallet edges
+
+# Robot motion / TCP / speeds (tune these)
+set_tcp("tool0")         # set TCP name as configured in DART (adjust if different)
+set_velj(60.0)           # joint vel
+set_accj(120.0)          # joint acc
+set_velx(200.0, 100.0)   # linear vel (mm/s), orient vel (deg/s)
+set_accx(800.0, 400.0)   # linear acc, orient acc
+
+# Pick/place poses - calibrate in your cell
+PICK_PRE = posx(300, 0, 350, 0, 180, 0)    # safe pre-pick pose (above the part)
+PICK_POS = posx(300, 0, 300, 0, 180, 0)    # pick position (where gripper engages tube)
+
+# Pallet origin (calibrated reference corner for stacking) - this is the first placement point
+# PALLET_ORIGIN is the center of the first placed tube (layer 0, row 0, column 0)
+PALLET_ORIGIN = posx(1000, -300, 200, 0, 180, 0)   # calibrate to your pallet corner
+
+# Tube geometry (set real values)
+TUBE_HEIGHT = 50.0    # mm - height added per layer (stack thickness)
+PLACEMENT_CLEARANCE_Z = 30.0  # mm above place pose when approaching/leaving
+
+# Small safety offsets
+PLACE_APPROACH_DIST = 100.0  # mm in Z for approach above pallet
+PICK_APPROACH_DIST = 50.0    # mm to retract after picking
+
+# -----------------------------
+# --- Helper functions -------
+# -----------------------------
+def parse_length_msg(rx_msg):
+    # parse "LENGTH:<value>" (string) -> float or None
+    try:
+        if rx_msg.startswith("LENGTH:"):
+            val = float(rx_msg.split(":")[1].strip())
+            return val
+    except:
+        pass
+    return None
+
+def clamp_length(L):
+    # validate tube length range 300..1000 mm
+    if L < 300.0 or L > 1000.0:
+        return False
+    return True
+
+def decide_rows_per_layer(L):
+    # stacking logic based on length
+    if L >= 600.0:
+        return 1
+    elif L >= 400.0:
+        return 2
+    else:
+        return 3
+
+def compute_layout(L, rowsPerLayer):
+    # Compute columns and X/Y spacing for a pallet.
+    # columns is number of tubes that fit along pallet length (X axis).
+    # We place tubes end-to-end with a small gap of 10 mm.
+    gap = 10.0
+    x_spacing = L + gap
+    available_x = PALLET_LENGTH - 2.0 * PALLET_EDGE_MARGIN
+    columns = int(max(1, int(available_x // x_spacing)))
+
+    # Y spacing across pallet width for the given number of rows
+    if rowsPerLayer == 1:
+        y_offsets = [0.0]  # centre row
+    else:
+        available_y = PALLET_WIDTH - 2.0 * PALLET_EDGE_MARGIN
+        if rowsPerLayer > 1:
+            y_step = 0.0
+            if rowsPerLayer == 2:
+                # two rows symmetric about center
+                y_step = available_y / 1.0
+                half = y_step / 2.0
+                y_offsets = [-half, half]
+            else:
+                # three rows: left/mid/right
+                y_step = available_y / (rowsPerLayer - 1)
+                base = -available_y / 2.0
+                y_offsets = [base + i * y_step for i in range(rowsPerLayer)]
+        else:
+            y_offsets = [0.0]
+
+    # X offsets: columns placed along +X relative to origin center of first tube
+    # We place columns centered: compute first column x so entire pattern is centered on pallet length
+    total_x_span = columns * x_spacing
+    x_start = - (total_x_span / 2.0) + (x_spacing / 2.0)
+    x_offsets = [ x_start + c * x_spacing for c in range(columns) ]
+
+    return x_offsets, y_offsets, columns
+
+def place_pose_for_index(origin, x_off, y_off, layer):
+    # produce place pose for given offsets and layer -> uses trans()
+    z_off = layer * TUBE_HEIGHT
+    # trans(origin, [dx,dy,dz, dA,dB,dC], ref_in, ref_out)
+    return trans(origin, [x_off, y_off, z_off, 0, 0, 0], DR_BASE, DR_BASE)
+
+# -----------------------------
+# --- Main program -----------
+# -----------------------------
+def main():
+    # open TCP client to external Python app
+    g_sock = client_socket_open(SERVER_IP, SERVER_PORT)
+    tp_popup("Socket opened: {0}:{1}".format(SERVER_IP, SERVER_PORT), DR_PM_MESSAGE)
+
+    # keep single placement counters
+    placed_count = 0
+
+    # stacking control: keep track of current layer/row/col indices
+    current_layer = 0
+    current_col = 0
+    current_row = 0
+
+    # connect loop - receives one LENGTH message and executes a stacking cycle
+    while True:
+        # read incoming TCP packet (blocks indefinitely by default)
+        res, rx_data = client_socket_read(g_sock)  # examples in manual show this usage. :contentReference[oaicite:3]{index=3}
+        if res < 0:
+            # connection error -> attempt simple reconnect
+            tp_log("TCP read error (res={0}). Attempting reconnect...".format(res))
+            client_socket_close(g_sock)
+            wait(0.5)
+            g_sock = client_socket_open(SERVER_IP, SERVER_PORT)
+            continue
+
+        # decode bytes to string
+        rx_msg = rx_data.decode()
+        tp_log("RX: " + rx_msg)
+
+        # parse tube length
+        tube_len = parse_length_msg(rx_msg)
+        if tube_len is None:
+            tp_log("Invalid message format. Expect LENGTH:<value>")
+            continue
+
+        # validate range
+        if not clamp_length(tube_len):
+            tp_popup("Length out of range: {0} mm".format(tube_len), DR_PM_ERROR)
+            continue
+
+        # decide stacking params
+        rowsPerLayer = decide_rows_per_layer(tube_len)
+        x_offsets, y_offsets, columns = compute_layout(tube_len, rowsPerLayer)
+        tp_log("L={0} mm -> rows={1}, cols={2}".format(tube_len, rowsPerLayer, columns))
+
+        # ensure pallet origin and limits set by user - quick check
+        if columns < 1:
+            tp_popup("Cannot fit any tube on pallet with current settings", DR_PM_WARNING)
+            continue
+
+        # wait for photoelectric sensor before picking (blocking) - uses wait_digital_input. :contentReference[oaicite:4]{index=4}
+        tp_log("Waiting for photo sensor (input {0})".format(PHOTO_IN))
+        wait_digital_input(PHOTO_IN, ON)  # blocks until sensor is ON
+
+        # Pick sequence (safe approach -> pick -> retract)
+        movej(PICK_PRE)            # fast move to pre-pick
+        movel(PICK_POS, v=100.0, a=200.0)  # linear approach to pick
+        set_digital_output(GRIP_OUT, ON)   # close gripper (pneumatic) - set_digital_output docs. :contentReference[oaicite:5]{index=5}
+        wait(0.2)                 # small wait to ensure grip
+        # retract to safe pre-pick
+        movel(trans(PICK_POS, [0, 0, PICK_APPROACH_DIST, 0, 0, 0], DR_BASE, DR_BASE), v=120.0, a=240.0)
+
+        # compute current place indices
+        # If current_col exceeds columns, wrap and increment row; if row exceeds rowsPerLayer, wrap and increment layer
+        # Place index progression: columns change fastest
+        # Get current offsets
+        x_off = x_offsets[current_col]
+        y_off = y_offsets[current_row]
+        place_pose = place_pose_for_index(PALLET_ORIGIN, x_off, y_off, current_layer)
+
+        # Move to safe above place
+        pre_place = trans(place_pose, [0, 0, PLACE_APPROACH_DIST + current_layer * 0.0, 0, 0, 0], DR_BASE, DR_BASE)
+        movej(pre_place)   # safe joint move to above placement
+        movel(place_pose, v=100.0, a=200.0)  # linear down to place
+        set_digital_output(GRIP_OUT, OFF)    # open gripper to release tube
+        wait(0.1)
+        # move up after placing
+        movel(trans(place_pose, [0, 0, PLACE_APPROACH_DIST, 0, 0, 0], DR_BASE, DR_BASE), v=150.0, a=300.0)
+
+        # update counters for next placement
+        placed_count += 1
+        current_col += 1
+        if current_col >= columns:
+            current_col = 0
+            current_row += 1
+            if current_row >= rowsPerLayer:
+                # new layer
+                current_row = 0
+                current_layer += 1
+
+        tp_log("Placed # {0} at layer {1}, row {2}, col {3}".format(placed_count, current_layer, current_row, current_col))
+
+        # Optional: stop when pallet full (user can customize)
+        # Compute total capacity estimate
+        capacity_per_layer = rowsPerLayer * columns
+        max_layers = int((2000.0) // TUBE_HEIGHT)  # safety max; user can adjust
+        if (current_layer * capacity_per_layer + current_row * columns + current_col) >= capacity_per_layer * max_layers:
+            tp_popup("Pallet full or reached max layers - stopping", DR_PM_MESSAGE)
+            break
+
+    # close socket before exit
+    client_socket_close(g_sock)
+    tp_popup("Program finished", DR_PM_MESSAGE)
+
+# run main program
+main()
